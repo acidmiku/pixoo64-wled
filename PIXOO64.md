@@ -9,6 +9,10 @@ ArtNet / DDP), OTA updates — no Divoom cloud, no Divoom app.
 Stock firmware was: 1 fps over its HTTP API and a mandatory vendor app.
 This port: ~30 fps realtime streaming and the entire WLED ecosystem.
 
+Don't want to build? Grab the ready `firmware.bin` from
+[Releases](https://github.com/acidmiku/pixoo64-wled/releases) and skip to
+[Flash](#flash).
+
 ![Main board, front](pixoo64/board_front.jpg)
 ![Main board, back](pixoo64/board_back.jpg)
 
@@ -54,9 +58,13 @@ hardware) — `BusPixoo` is a line-faithful port of it into WLED's bus API.
 ## Build
 
 ```
-git checkout pixoo64
-pio run -e pixoo64        # -> .pio/build/pixoo64/firmware.bin (~1.34 MB)
+git clone https://github.com/acidmiku/pixoo64-wled.git
+cd pixoo64-wled             # lands on the pixoo64 branch (repo default)
+pip install platformio      # skip if you already have PlatformIO Core
+pio run -e pixoo64          # -> .pio/build/pixoo64/firmware.bin (~1.34 MB)
 ```
+
+Platform/toolchain and libraries download automatically on first build.
 
 - Env `pixoo64` in `platformio_override.ini`: `esp-wrover-kit`, flash 8 MB
   DIO/40 MHz, PSRAM, partition table `tools/pixoo64_partitions.csv`.
@@ -71,14 +79,22 @@ pio run -e pixoo64        # -> .pio/build/pixoo64/firmware.bin (~1.34 MB)
 ## Flash
 
 You need one UART session (USB-UART adapter, 3.3 V): GND/TX/RX, and **strap
-IO0 to GND** to enter download mode (remove the strap to run).
+IO0 to GND** to enter download mode (remove the strap to run). **Back up the
+stock firmware first** — it's your restore path:
 
 ```
-# WLED into both OTA slots + erased otadata = deterministic boot
-esptool --port COMx --baud 921600 write-flash \
-  0x10000 firmware.bin 0x290000 firmware.bin 0xD000 otadata_erased.bin
-# ('otadata_erased.bin' is just 8192 x 0xFF)
+esptool --port COMx --baud 921600 read-flash 0x0 0x800000 stock_backup.bin
 ```
+
+Then flash WLED into both OTA slots + erase otadata (deterministic boot):
+
+```
+esptool --port COMx --baud 921600 write-flash \
+  0x10000 firmware.bin 0x290000 firmware.bin 0xD000 pixoo64/otadata_erased.bin
+```
+
+(`pixoo64/otadata_erased.bin` is in this repo — 8192 bytes of 0xFF, i.e. an
+erased otadata partition.)
 
 Stock bootloader and partition table stay untouched. First boot: `WLED-AP`
 (password `wled1234`) → http://4.3.2.1 → set your WiFi.
@@ -86,10 +102,8 @@ Stock bootloader and partition table stay untouched. First boot: `WLED-AP`
 **From then on, OTA over WiFi:** WLED UI → Security & Updates, or
 `curl -F "update=@firmware.bin" http://<ip>/update`. Verified working.
 
-**Restore stock:** keep a full-chip dump *before* your first flash
-(`esptool read-flash 0x0 0x800000 stock.bin`), then
-`esptool write-flash 0x0 stock.bin`. Stock images are unsigned and the
-bootloader does no rollback, so this always works.
+**Restore stock:** `esptool write-flash 0x0 stock_backup.bin`. Stock images
+are unsigned and the bootloader does no rollback, so this always works.
 
 ## Recommended first-boot config
 
