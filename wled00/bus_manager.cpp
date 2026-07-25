@@ -17,6 +17,11 @@
 #include "bus_wrapper.h"
 #include "wled.h"
 
+#ifdef WLED_ENABLE_PIXOO64
+#include <SPI.h>
+#include "esp_heap_caps.h"
+#endif
+
 // functions to get/set bits in an array - based on functions created by Brandon for GOL
 //  toDo : make this a class that's completely defined in a header file
 // note: these functions are automatically inline by the compiler
@@ -1220,6 +1225,144 @@ size_t BusHub75Matrix::getPins(uint8_t* pinArray) const {
 #endif
 // ***************************************************************************
 
+#ifdef WLED_ENABLE_PIXOO64
+// Divoom LED-board packet protocol: 0xAA, len_lo, len_hi, cmd, <payload>, 0xBB (len = payload bytes)
+static constexpr uint8_t  PIXOO_PKT_HEAD   = 0xAA;
+static constexpr uint8_t  PIXOO_PKT_TAIL   = 0xBB;
+static constexpr uint8_t  PIXOO_CMD_DATA   = 0x00;
+static constexpr uint8_t  PIXOO_CMD_LIGHT  = 0x01;
+static constexpr uint8_t  PIXOO_CMD_UNUSED = 0x21;
+static constexpr uint8_t  PIXOO_CMD_SET_RGB_IOUT = 0x22;
+static constexpr size_t   PIXOO_PKT_STATIC = 5;   // 4-byte header + tail
+static constexpr uint8_t  PIXOO_DEFAULT_IOUT = 75;  // per-channel LED current / white balance default
+
+// Pack a `0xAA len cmd data 0xBB` packet into buf; returns the packet length.
+static inline size_t pixooBuildPacket(uint8_t *buf, uint8_t cmd, const uint8_t *data, uint16_t len) {
+  buf[0] = PIXOO_PKT_HEAD;
+  buf[1] = len & 0xFF;
+  buf[2] = (len >> 8) & 0xFF;
+  buf[3] = cmd;
+  if (data != nullptr && len > 0) memcpy(buf + 4, data, len);
+  buf[4 + len] = PIXOO_PKT_TAIL;
+  return len + PIXOO_PKT_STATIC;
+}
+
+// Fill `total` bytes at buf with a single UNUSED padding packet (rest of buf must be zeroed).
+static inline void pixooPadUnused(uint8_t *buf, size_t total) {
+  const uint16_t len = total - PIXOO_PKT_STATIC;
+  buf[0] = PIXOO_PKT_HEAD;
+  buf[1] = len & 0xFF;
+  buf[2] = (len >> 8) & 0xFF;
+  buf[3] = PIXOO_CMD_UNUSED;
+  buf[total - 1] = PIXOO_PKT_TAIL;
+}
+
+BusPixoo::BusPixoo(const BusConfig &bc)
+: Bus(bc.type, bc.start, bc.autoWhite, min(bc.count, (uint16_t)PANEL_PIXELS), bc.reversed, bc.refreshReq) {
+  _valid = false;
+  _hasRgb = true;
+  _hasWhite = false;
+  _hasCCT = false;
+  // bc pins: [0]=CLK, [1]=MOSI, [2]=CS; fall back to Pixoo defaults if unconfigured
+  _pins[0] = PinManager::isPinOk(bc.pins[0]) ? bc.pins[0] : 25;
+  _pins[1] = PinManager::isPinOk(bc.pins[1]) ? bc.pins[1] : 33;
+  _pins[2] = PinManager::isPinOk(bc.pins[2]) ? bc.pins[2] : 26;
+  for (uint8_t i = 0; i < 3; i++) PinManager::allocatePin(_pins[i], true, PinOwner::Pixoo64);
+  _valid = true; // hardware init happens in begin()
+}
+
+void BusPixoo::begin() {
+  if (!_valid) return;
+  _valid = false;
+  // The frame is shipped in one SPI transfer, so keep it in DMA-capable internal RAM.
+  // (+3 so the FIFO writer's word-sized reads can never run past the allocation)
+  _frame = (uint8_t *)heap_caps_malloc(FRAME_SIZE + 3, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+  if (_frame == nullptr) {
+    DEBUGBUS_PRINTLN(F("Pixoo64: frame buffer allocation failed"));
+    return;
+  }
+  memset(_frame, 0, FRAME_SIZE + 3);
+  // Pre-build the constant DATA-packet framing; only the RGB888 payload changes per frame.
+  _frame[0] = PIXOO_PKT_HEAD;
+  _frame[1] = DATA_SIZE & 0xFF;
+  _frame[2] = (DATA_SIZE >> 8) & 0xFF;
+  _frame[3] = PIXOO_CMD_DATA;
+  _frame[4 + DATA_SIZE] = PIXOO_PKT_TAIL;
+  pixooPadUnused(_frame + DATA_SIZE + PIXOO_PKT_STATIC, DMA_CHUNK);
+
+  SPI.begin(_pins[0], -1, _pins[1], _pins[2]);  // SCK, MISO (none), MOSI, SS
+  pinMode(_pins[2], OUTPUT);
+  digitalWrite(_pins[2], HIGH);
+
+  // Set the per-channel LED current once at startup, then the initial brightness.
+  const uint8_t iout[3] = {PIXOO_DEFAULT_IOUT, PIXOO_DEFAULT_IOUT, PIXOO_DEFAULT_IOUT};
+  sendCommand_(PIXOO_CMD_SET_RGB_IOUT, iout, sizeof(iout));
+  _lastBriPct = 100;
+  sendCommand_(PIXOO_CMD_LIGHT, &_lastBriPct, 1);
+  _valid = true;
+}
+
+void BusPixoo::sendCommand_(uint8_t cmd, const uint8_t *data, uint16_t len) {
+  uint8_t scratch[DMA_CHUNK];
+  memset(scratch, 0, DMA_CHUNK);
+  const size_t used = pixooBuildPacket(scratch, cmd, data, len);
+  if (DMA_CHUNK - used >= PIXOO_PKT_STATIC) pixooPadUnused(scratch + used, DMA_CHUNK - used);
+  SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
+  digitalWrite(_pins[2], LOW);
+  SPI.writeBytes(scratch, DMA_CHUNK);
+  digitalWrite(_pins[2], HIGH);
+  SPI.endTransaction();
+}
+
+void BusPixoo::setBrightness(uint8_t b) {
+  Bus::setBrightness(b);
+  if (!_valid) return;
+  const uint8_t pct = ((unsigned)b * 100 + 127) / 255;  // map 0..255 to 0..100 with rounding
+  if (pct == _lastBriPct) return;                       // only send LIGHT when it actually changed
+  _lastBriPct = pct;
+  sendCommand_(PIXOO_CMD_LIGHT, &pct, 1);
+}
+
+void BusPixoo::setPixelColor(unsigned pix, uint32_t c) {
+  if (!_valid || _frame == nullptr || pix >= PANEL_PIXELS) return;
+  if (_reversed) pix = PANEL_PIXELS - 1 - pix;
+  const size_t off = 4 + (size_t)pix * 3;  // payload starts after the 4-byte DATA packet header
+  _frame[off]     = R(c);
+  _frame[off + 1] = G(c);
+  _frame[off + 2] = B(c);
+}
+
+uint32_t BusPixoo::getPixelColor(unsigned pix) const {
+  if (!_valid || _frame == nullptr || pix >= PANEL_PIXELS) return 0;
+  const size_t off = 4 + (size_t)pix * 3;
+  return ((uint32_t)_frame[off] << 16) | ((uint32_t)_frame[off + 1] << 8) | _frame[off + 2];
+}
+
+void BusPixoo::show() {
+  if (!_valid || _frame == nullptr) return;
+  SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
+  digitalWrite(_pins[2], LOW);
+  SPI.writeBytes(_frame, FRAME_SIZE);  // ~12.5 ms at 8 MHz, one CS assertion
+  digitalWrite(_pins[2], HIGH);
+  SPI.endTransaction();
+}
+
+size_t BusPixoo::getPins(uint8_t* pinArray) const {
+  if (pinArray) memcpy(pinArray, _pins, 3);
+  return 3;
+}
+
+void BusPixoo::cleanup() {
+  _valid = false;
+  for (uint8_t i = 0; i < 3; i++) PinManager::deallocatePin(_pins[i], PinOwner::Pixoo64);
+  if (_frame != nullptr) {
+    heap_caps_free(_frame);
+    _frame = nullptr;
+  }
+}
+#endif
+// ***************************************************************************
+
 BusPlaceholder::BusPlaceholder(const BusConfig &bc)
 : Bus(bc.type, bc.start, bc.autoWhite, bc.count, bc.reversed, bc.refreshReq)
 , _colorOrder(bc.colorOrder)
@@ -1278,6 +1421,10 @@ int BusManager::add(const BusConfig &bc, bool placeholder) {
   } else if (Bus::isHub75(bc.type)) {
     busses.push_back(make_unique<BusHub75Matrix>(bc));
 #endif
+#ifdef WLED_ENABLE_PIXOO64
+  } else if (Bus::isPixoo(bc.type)) {
+    busses.push_back(make_unique<BusPixoo>(bc));
+#endif
   } else if (Bus::isDigital(bc.type)) {
     busses.push_back(make_unique<BusDigital>(bc));
   } else if (Bus::isOnOff(bc.type)) {
@@ -1311,6 +1458,9 @@ String BusManager::getLEDTypesJSONString() {
   //json += LEDTypesToJson(BusVirtual::getLEDTypes());
   #ifdef WLED_ENABLE_HUB75MATRIX
   json += LEDTypesToJson(BusHub75Matrix::getLEDTypes());
+  #endif
+  #ifdef WLED_ENABLE_PIXOO64
+  json += LEDTypesToJson(BusPixoo::getLEDTypes());
   #endif
 
   json.setCharAt(json.length()-1, ']'); // replace last comma with bracket

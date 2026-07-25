@@ -359,6 +359,9 @@ static_assert(WLED_MAX_BUSSES <= 32, "WLED_MAX_BUSSES exceeds hard limit");
 #define TYPE_HUB75MATRIX_QS      66
 #define TYPE_HUB75MATRIX_MAX     71
 
+//Pixoo SPI panel types (72-79)
+#define TYPE_PIXOO64             72            //Divoom Pixoo 64 (64x64 RGB panel, SPI link to LED driver board)
+
 //Network types (master broadcast) (80-95)
 #define TYPE_VIRTUAL_MIN         80
 #define TYPE_NET_DDP_RGB         80            //network DDP RGB bus (master broadcast bus)

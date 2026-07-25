@@ -171,7 +171,7 @@ class Bus {
     inline  bool     containsPixel(uint16_t pix) const          { return pix >= _start && pix < _start + _len; }
 
     static inline std::vector<LEDType> getLEDTypes()            { return {{TYPE_NONE, "", PSTR("None")}}; } // not used. just for reference for derived classes
-    static constexpr size_t   getNumberOfPins(uint8_t type)     { return isVirtual(type) ? 4 : isPWM(type) ? numPWMPins(type) : isHub75(type) ? 5 : is2Pin(type) + 1; } // credit @PaoloTK; for HUB75 the 5 slots store config params (panelW, panelH, chain, rows, cols), not GPIO pins
+    static constexpr size_t   getNumberOfPins(uint8_t type)     { return isVirtual(type) ? 4 : isPWM(type) ? numPWMPins(type) : isHub75(type) ? 5 : isPixoo(type) ? 3 : is2Pin(type) + 1; } // credit @PaoloTK; for HUB75 the 5 slots store config params (panelW, panelH, chain, rows, cols), not GPIO pins
     static constexpr size_t   getNumberOfChannels(uint8_t type) { return hasWhite(type) + 3*hasRGB(type) + hasCCT(type); }
     static constexpr bool hasRGB(uint8_t type) {
       return !((type >= TYPE_WS2812_1CH && type <= TYPE_WS2812_WWA) || type == TYPE_ANALOG_1CH || type == TYPE_ANALOG_2CH || type == TYPE_ONOFF);
@@ -195,6 +195,7 @@ class Bus {
     static constexpr bool  isPWM(uint8_t type)        { return (type >= TYPE_ANALOG_MIN && type <= TYPE_ANALOG_MAX); }
     static constexpr bool  isVirtual(uint8_t type)    { return (type >= TYPE_VIRTUAL_MIN && type <= TYPE_VIRTUAL_MAX); }
     static constexpr bool  isHub75(uint8_t type)      { return (type >= TYPE_HUB75MATRIX_MIN && type <= TYPE_HUB75MATRIX_MAX); }
+    static constexpr bool  isPixoo(uint8_t type)      { return type == TYPE_PIXOO64; }
     static constexpr bool  is16bit(uint8_t type)      { return type == TYPE_UCS8903 || type == TYPE_UCS8904 || type == TYPE_SM16825; }
     static constexpr bool  mustRefresh(uint8_t type)  { return type == TYPE_TM1814; }
     static constexpr int   numPWMPins(uint8_t type)   { return (type - 40); }
@@ -448,6 +449,45 @@ class BusHub75Matrix : public Bus {
     static constexpr uint32_t IS_BLACK = 0x000000u;
     static constexpr uint32_t IS_DARKGREY = 0x333333u;
     static constexpr int PIN_COUNT = 14;
+};
+#endif
+
+#ifdef WLED_ENABLE_PIXOO64
+// Divoom Pixoo 64: 64x64 RGB panel. The ESP32 talks to a separate LED-driver board over SPI
+// using Divoom's packet protocol: 0xAA, len_lo, len_hi, cmd, <payload>, 0xBB (len = payload bytes).
+// A frame is a DATA (0x00) packet with 12288 bytes of RGB888 (row-major, top-left origin) plus a
+// trailing 240-byte UNUSED (0x21) padding packet, all sent in a single CS assertion.
+class BusPixoo : public Bus {
+  public:
+    BusPixoo(const BusConfig &bc);
+    [[gnu::hot]] void setPixelColor(unsigned pix, uint32_t c) override;
+    [[gnu::hot]] uint32_t getPixelColor(unsigned pix) const override;
+    void     begin() override;
+    void     show() override;
+    void     setBrightness(uint8_t b) override;
+    void     setColorOrder(uint8_t co) override {}             // panel is natively RGB; color order not applicable
+    uint8_t  getColorOrder() const override { return COL_ORDER_RGB; }
+    size_t   getPins(uint8_t* pinArray = nullptr) const override;
+    void     cleanup();
+
+    ~BusPixoo() { cleanup(); }
+
+    static std::vector<LEDType> getLEDTypes(void) {
+      return {{TYPE_PIXOO64, "SPI", PSTR("Divoom Pixoo 64 (64x64)")}};
+    }
+
+  private:
+    void sendCommand_(uint8_t cmd, const uint8_t *data, uint16_t len);
+
+    static constexpr unsigned PANEL_SIDE   = 64;
+    static constexpr unsigned PANEL_PIXELS = PANEL_SIDE * PANEL_SIDE;       // 4096
+    static constexpr size_t   DATA_SIZE    = PANEL_PIXELS * 3;              // 12288 RGB888 bytes
+    static constexpr size_t   DMA_CHUNK    = 240;                           // LED board SPI DMA chunk
+    static constexpr size_t   FRAME_SIZE   = DATA_SIZE + 5 + DMA_CHUNK;     // DATA packet + UNUSED packet = 12533
+
+    uint8_t *_frame = nullptr;                  // full SPI frame, DMA-capable internal RAM
+    uint8_t  _pins[3] = {255, 255, 255};        // CLK, MOSI, CS
+    uint8_t  _lastBriPct = 255;                 // last LIGHT percent sent to the panel (255 = unknown)
 };
 #endif
 
