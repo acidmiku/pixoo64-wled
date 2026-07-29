@@ -86,18 +86,33 @@ stock firmware first** — it's your restore path:
 esptool --port COMx --baud 921600 read-flash 0x0 0x800000 stock_backup.bin
 ```
 
-Then flash WLED into both OTA slots + erase otadata (deterministic boot):
+Then flash WLED into both OTA slots, the fixed partition table, and erased
+otadata (deterministic boot):
 
 ```
 esptool --port COMx --baud 921600 write-flash \
-  0x10000 firmware.bin 0x290000 firmware.bin 0xD000 pixoo64/otadata_erased.bin
+  0x10000 firmware.bin 0x290000 firmware.bin \
+  0x8000 partitions.bin \
+  0xD000 pixoo64/otadata_erased.bin
 ```
 
-(`pixoo64/otadata_erased.bin` is in this repo — 8192 bytes of 0xFF, i.e. an
-erased otadata partition.)
+- **`partitions.bin` is required** (`wled/.pio/build/pixoo64/partitions.bin`
+  after building, or from Releases): the stock Divoom table labels the
+  filesystem partition `storage`, but WLED mounts LittleFS by the label
+  `spiffs`. Without it the panel runs but **persists nothing** — WiFi and
+  config are lost on every reboot (`fs.t: 0` in `/json/info`). Offsets and
+  sizes are otherwise identical to stock, so stock restore stays a single
+  full-dump write. (Early release notes omitted this file — if you flashed
+  without it, re-flash just `0x8000 partitions.bin`; no need to redo the rest.)
+- `pixoo64/otadata_erased.bin` is in this repo — 8192 bytes of 0xFF, i.e. an
+  erased otadata partition.
 
-Stock bootloader and partition table stay untouched. First boot: `WLED-AP`
-(password `wled1234`) → http://4.3.2.1 → set your WiFi.
+**Panel already closed with no UART and a broken FS?** A community member
+repaired theirs over WiFi: an OTA-flashed intermediate firmware that rewrites
+only the 0x8000 partition sector, then reboots — afterwards normal OTA works.
+See the r/WLED thread linked from the repo discussions if you need that path.
+
+First boot: `WLED-AP` (password `wled1234`) → http://4.3.2.1 → set your WiFi.
 
 **From then on, OTA over WiFi:** WLED UI → Security & Updates, or
 `curl -F "update=@firmware.bin" http://<ip>/update`. Verified working.
