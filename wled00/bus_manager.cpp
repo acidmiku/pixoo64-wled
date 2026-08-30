@@ -1325,6 +1325,7 @@ void BusPixoo::setBrightness(uint8_t b) {
 
 void BusPixoo::setPixelColor(unsigned pix, uint32_t c) {
   if (!_valid || _frame == nullptr || pix >= PANEL_PIXELS) return;
+  if (Bus::_cct >= 1900) c = colorBalanceFromKelvin(Bus::_cct, c); // color correction from CCT
   if (_reversed) pix = PANEL_PIXELS - 1 - pix;
   const size_t off = 4 + (size_t)pix * 3;  // payload starts after the 4-byte DATA packet header
   _frame[off]     = R(c);
